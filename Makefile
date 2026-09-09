@@ -1,4 +1,4 @@
-obj-m += e1000e.o
+obj-m += mye1000e.o
 
 #KDIR ?= /lib/modules/$(shell uname -r)/build
 KDIR ?= /home/liang/Desktop/code/linux-kgdb

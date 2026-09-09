@@ -1,0 +1,25 @@
+{
+    "configurations": [
+        {
+            "name": "Linux-KGDB",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/home/liang/Desktop/code/linux-kgdb/include",
+                "/home/liang/Desktop/code/linux-kgdb/include/uapi",
+                "/home/liang/Desktop/code/linux-kgdb/arch/x86/include",
+                "/home/liang/Desktop/code/linux-kgdb/arch/x86/include/uapi",
+                "/home/liang/Desktop/code/linux-kgdb/arch/x86/include/generated"
+            ],
+            "defines": [
+                "__KERNEL__",
+                "MODULE"
+            ],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "gnu11",
+            "cppStandard": "gnu++17",
+            "intelliSenseMode": "linux-gcc-x64",
+            "configurationProvider": "ms-vscode.makefile-tools"
+        }
+    ],
+    "version": 4
+}

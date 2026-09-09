@@ -15,10 +15,12 @@
 #include <linux/ethtool.h>
 #include <linux/interrupt.h>
 #include <linux/version.h>
-#include "e1000e.h"
+#include "mye1000e.h"
 
 #define DRV_NAME "e1000e_waterdog"
 #define DRV_VERSION "0.1"
+
+#define DEBUG 1
 
 struct nic_priv {
 	struct pci_dev *pdev;
@@ -26,6 +28,13 @@ struct nic_priv {
 	int irq;
 	spinlock_t lock; /* protects the device state */
 	void __iomem *hw_addr; /* BAR0 mapped registers */
+	void __iomem *hw_flash_addr; /* BAR1 mapped registers */
+	void __iomem *hw_io_addr; /* BAR2 mapped registers */
+
+	resource_size_t bar0_start;
+	resource_size_t bar0_len;
+	resource_size_t bar1_start;
+	resource_size_t bar1_len;
 };
 
 static int nic_open(struct net_device *ndev)
@@ -83,28 +92,34 @@ static int e1000e_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	int err;
 	u32 status;
 
+	// 1. Enable the PCI device
 	err = pci_enable_device(pdev);
 	if (err)
 		return dev_err_probe(&pdev->dev, err,
 				     "pci_enable_device failed\n");
 
+	// 2. Request the PCI regions (BARs) for the device
 	err = pci_request_regions(pdev, DRV_NAME);
 	if (err)
 		goto err_disable_device;
 
+	// 3. Set the device as a bus master to allow DMA
 	pci_set_master(pdev);
 
+	// 4. Set the DMA mask to 64 bits and ensure coherent DMA
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (err) {
 		dev_err(&pdev->dev, "no usable DMA configuration\n");
 		goto err_release_regions;
 	}
 
+	// 5. Allocate a net_device structure with space for our private data
 	ndev = alloc_etherdev(sizeof(*priv));
 	if (!ndev) {
 		err = -ENOMEM;
 		goto err_release_regions;
 	}
+	// 6. Initialize the private data structure
 	SET_NETDEV_DEV(ndev, &pdev->dev);
 	priv = netdev_priv(ndev);
 	priv->pdev = pdev;
@@ -112,10 +127,27 @@ static int e1000e_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	priv->irq = pdev->irq;
 	spin_lock_init(&priv->lock);
 
+	// 7. Map the BAR0 MMIO region into kernel virtual address space
 	priv->hw_addr = pci_iomap(pdev, 0, pci_resource_len(pdev, 0));
 	if (!priv->hw_addr) {
 		err = -EIO;
-		goto err_free_priv;
+		goto err_free_netdev;
+	}
+	priv->bar0_start = pci_resource_start(pdev, 0);
+	priv->bar0_len = pci_resource_len(pdev, 0);
+
+	priv->hw_flash_addr = pci_iomap(pdev, 1, pci_resource_len(pdev, 1));
+	if (!priv->hw_flash_addr) {
+		err = -EIO;
+		goto err_unmap_bar0;
+	}
+	priv->bar1_start = pci_resource_start(pdev, 1);
+	priv->bar1_len = pci_resource_len(pdev, 1);
+
+	priv->hw_io_addr = pci_iomap(pdev, 2, pci_resource_len(pdev, 2));
+	if (!priv->hw_io_addr) {
+		err = -EIO;
+		goto err_unmap_bar1;
 	}
 
 	status = ioread32(priv->hw_addr + E1000_STATUS);
@@ -132,12 +164,30 @@ static int e1000e_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	return 0;
 
-err_free_priv:
-	kfree(priv);
+/* BAR4 mapping failed:
+ * BAR4 was not successfully mapped,
+ * so only BAR1 and BAR0 need cleanup.
+ */
+err_unmap_bar1:
+	if (priv->hw_flash_addr)
+		pci_iounmap(pdev, priv->hw_flash_addr);
+
+/* BAR1 mapping failed:
+ * BAR1 was not successfully mapped,
+ * so only BAR0 needs cleanup.
+ */
+err_unmap_bar0:
+	pci_iounmap(pdev, priv->hw_addr);
+
+err_free_netdev:
+	free_netdev(ndev);
+
 err_release_regions:
 	pci_release_regions(pdev);
+
 err_disable_device:
 	pci_disable_device(pdev);
+
 	return err;
 }
 
@@ -146,8 +196,16 @@ static void e1000e_remove(struct pci_dev *pdev)
 	struct nic_priv *priv = pci_get_drvdata(pdev);
 
 	pci_iounmap(pdev, priv->hw_addr);
+	pci_iounmap(pdev, priv->hw_flash_addr);
+	pci_iounmap(pdev, priv->hw_io_addr);
+
+	// 5. Free the net_device structure
 	kfree(priv);
+
+	// 2. Release the PCI regions (BARs) for the device
 	pci_release_regions(pdev);
+
+	// 1. Disable the PCI device
 	pci_disable_device(pdev);
 }
 
