@@ -131,6 +131,8 @@
 #define E1000_IAM 0x000E0 /* Interrupt Acknowledge Auto Mask */
 #define E1000_EIAC 0x000DC /* Extended Interrupt Auto Clear (82574) */
 #define E1000_IVAR 0x000E4 /* Interrupt Vector Allocation (82574) */
+#define E1000_IVAR_MISC \
+	0x000E8 /* Interrupt Vector Allocation for Misc (82574) */
 #define E1000_EITR(_n) (0x000E8 + (_n) * 4) /* Extended ITR, 82574: 0-4 */
 #define E1000_GPIE 0x01514 /* General Purpose Interrupt Enable */
 
