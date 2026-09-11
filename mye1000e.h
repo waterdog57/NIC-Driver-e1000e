@@ -247,7 +247,9 @@
 #define E1000_TCTL_EN 0x00000002 /* Transmit enable */
 #define E1000_TCTL_PSP 0x00000008 /* Pad short packets */
 #define E1000_TCTL_CT_SHIFT 4 /* Collision threshold */
+#define E1000_TCTL_CT 0x00000FF0 /* Collision Threshold */
 #define E1000_TCTL_COLD_SHIFT 12 /* Collision distance */
+#define E1000_TCTL_COLD 0x003FF000 /* Collision Distance */
 #define E1000_TCTL_SWXOFF 0x00400000 /* Software XOFF transmission */
 #define E1000_TCTL_RTLC 0x01000000 /* Re-transmit on late collision */
 

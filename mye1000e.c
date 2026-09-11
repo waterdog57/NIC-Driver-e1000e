@@ -19,7 +19,11 @@
 
 #define DRV_NAME "e1000e_waterdog"
 #define DRV_VERSION "0.1"
-#define NIC_MSIX_VECTORS (5)
+#define NIC_TX_RING (2)
+#define NIC_RX_RING (2)
+#define NIC_OTHER_RING (1)
+#define NIC_MSIX_VECTORS (NIC_TX_RING + NIC_RX_RING + NIC_OTHER_RING)
+#define NIC_TX_RING_SIZE (256)
 #define E1000_IVAR_VAL_RX0 (0x0 | 0x80) /* Vector 0 + Enable (bit 7) */
 #define E1000_IVAR_VAL_RX1 ((0x0 | 0x80) << 8) /* Vector 1 + Enable */
 #define E1000_IVAR_VAL_TX0 ((0x1 | 0x80) << 16) /* Vector 2 + Enable */
@@ -29,6 +33,26 @@
 struct msix_entry msix_entries[NIC_MSIX_VECTORS];
 
 #define DEBUG 1
+
+/* 82574L Legacy Tx Descriptor */
+struct e1000_tx_desc {
+	__le64 buffer_addr;
+	__le16 length;
+	u8 cso; /* Checksum Offset */
+	u8 cmd; /* Command Field (EOP | IFCS | RS) */
+	u8 status; /* Descriptor Status (DD bit) */
+	u8 css; /* Checksum Start */
+	__le16 special; /* VLAN Tag */
+};
+
+struct nic_tx_ring {
+	struct e1000_tx_desc *desc;
+	dma_addr_t dma;
+	struct sk_buff **skbs;
+	u16 next_to_use;
+	u16 next_to_clean;
+	u16 count;
+};
 
 struct nic_priv {
 	struct pci_dev *pdev;
@@ -43,7 +67,13 @@ struct nic_priv {
 	resource_size_t bar1_start;
 	resource_size_t bar1_len;
 	int num_vecs;
-	u8 msix_enabled;
+	u8 msix_enabled : 1;
+	u8 msi_enabled : 1;
+	u8 reserve : 6;
+	// ring
+	struct nic_tx_ring tx_ring[NIC_TX_RING];
+	struct nic_tx_ring rx_ring[NIC_RX_RING];
+	struct nic_tx_ring other_ring[NIC_OTHER_RING];
 };
 
 static irqreturn_t nic_msix_rx_isr(int irq, void *dev_id)
@@ -70,6 +100,90 @@ static irqreturn_t nic_msix_other_isr(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+static int nic_alloc_tx_resources(struct nic_priv *priv)
+{
+	int i;
+
+	for (i = 0; i < NIC_TX_RING; i++) {
+		struct nic_tx_ring *tx_ring = &priv->tx_ring[i];
+		tx_ring->count = NIC_TX_RING_SIZE;
+		tx_ring->desc = dma_alloc_coherent(
+			&priv->pdev->dev,
+			tx_ring->count * sizeof(struct e1000_tx_desc),
+			&tx_ring->dma, GFP_KERNEL);
+		if (!tx_ring->desc)
+			goto err_free_dma;
+
+		tx_ring->skbs = kcalloc(tx_ring->count,
+					sizeof(struct sk_buff *), GFP_KERNEL);
+		if (!tx_ring->skbs)
+			goto err_free_dma;
+
+		tx_ring->next_to_use = 0;
+		tx_ring->next_to_clean = 0;
+	}
+	return 0;
+
+err_free_dma:
+	while (i--) {
+		struct nic_tx_ring *tx_ring = &priv->tx_ring[i];
+		if (tx_ring->desc)
+			dma_free_coherent(&priv->pdev->dev,
+					  tx_ring->count *
+						  sizeof(struct e1000_tx_desc),
+					  tx_ring->desc, tx_ring->dma);
+		if (tx_ring->skbs)
+			kfree(tx_ring->skbs);
+	}
+	return -ENOMEM;
+}
+
+static int nic_free_tx_resources(struct nic_priv *priv)
+{
+	int i = NIC_TX_RING;
+
+	while (i--) {
+		struct nic_tx_ring *tx_ring = &priv->tx_ring[i];
+		if (tx_ring->desc)
+			dma_free_coherent(&priv->pdev->dev,
+					  tx_ring->count *
+						  sizeof(struct e1000_tx_desc),
+					  tx_ring->desc, tx_ring->dma);
+		if (tx_ring->skbs)
+			kfree(tx_ring->skbs);
+	}
+
+	return -ENOMEM;
+}
+
+static int tx_ring_init(struct nic_priv *priv)
+{
+	int i;
+	u32 tctl = ioread32(priv->hw_addr + E1000_TCTL);
+
+	for (i = 0; i < NIC_TX_RING; i++) {
+		struct nic_tx_ring *tx_ring = &priv->tx_ring[i];
+		// 1. Initialize the Tx Descriptor Ring Base Address and Length
+		iowrite32(tx_ring->dma & 0xFFFFFFFF,
+			  priv->hw_addr + E1000_TDBAL(i));
+		iowrite32((u32)(tx_ring->dma >> 32),
+			  priv->hw_addr + E1000_TDBAH(i));
+		iowrite32(tx_ring->count * sizeof(struct e1000_tx_desc),
+			  priv->hw_addr + E1000_TDLEN(i));
+
+		// 2. Initialize the Tx Descriptor Head and Tail Pointers
+		iowrite32(0, priv->hw_addr + E1000_TDH(i));
+		iowrite32(0, priv->hw_addr + E1000_TDT(i));
+	}
+	// 3. Enable the Transmit Unit by setting the TCTL register
+	tctl &= ~E1000_TCTL_COLD;
+	tctl |= E1000_TCTL_EN | E1000_TCTL_PSP | (0x0F << E1000_TCTL_CT_SHIFT) |
+		(0x40 << E1000_TCTL_COLD_SHIFT);
+	iowrite32(tctl, priv->hw_addr + E1000_TCTL);
+
+	return 0;
+}
+
 static int nic_open(struct net_device *ndev)
 {
 	struct nic_priv *priv = netdev_priv(ndev);
@@ -86,8 +200,15 @@ static int nic_open(struct net_device *ndev)
 			"Failed to allocate MSI-X vectors: %d\n", num_vecs);
 		return num_vecs;
 	}
-	priv->num_vecs = num_vecs;
-	priv->msix_enabled = 1;
+	if (priv->pdev->msix_enabled) {
+		dev_info(&priv->pdev->dev, "Using MSI-X mode (vectors: %d)\n",
+			 num_vecs);
+		priv->msix_enabled = 1;
+		priv->num_vecs = num_vecs;
+	} else if (priv->pdev->msi_enabled) {
+		dev_info(&priv->pdev->dev, "Using MSI mode\n");
+		priv->msi_enabled = 1;
+	}
 
 	/* 1. 2-Queue RSS */
 	/* Bit 0:1 = 01b, Enable RSS with 2 Queues */
@@ -125,6 +246,12 @@ static int nic_open(struct net_device *ndev)
 	if (err)
 		goto err_req_other;
 
+	// tx ring init
+	err = nic_alloc_tx_resources(priv);
+	if (err)
+		goto err_req_other;
+	tx_ring_init(priv);
+
 	return 0;
 
 err_req_other:
@@ -144,6 +271,8 @@ err_req_rx0:
 static int nic_stop(struct net_device *ndev)
 {
 	struct nic_priv *priv = netdev_priv(ndev);
+
+	nic_free_tx_resources(priv);
 
 	iowrite32(0xFFFFFFFF, priv->hw_addr + 0x000D8); /* E1000_EIMC */
 	iowrite32(0, priv->hw_addr + E1000_IVAR);
